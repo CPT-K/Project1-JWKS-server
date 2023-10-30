@@ -1,114 +1,160 @@
 """
 	Aurthor kmm0571 && chatGPT
 	Course: CSCE 3550.004
-	Date: 29 September 2023
-	Filename: server.py
+	Date: 27 October 2023
+	Filename: main.py
 	Description: Program to implement a basic JWKS server
 """
 
-import http.server
-import socketserver
-import json
-from datetime import datetime, timedelta
-import jwt
-from cryptography.hazmat.backends import default_backend
+import sqlite3
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from urllib.parse import urlparse, parse_qs
 import base64
+import json
+import jwt
+import datetime
 
-# Generate RSA key pair with a Key ID (kid) and expiry timestamp
-def generate_rsa_key_pair(kid, expiry_hours):
-    private_key = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=2048,
-        backend=default_backend()
+# Define the SQLite database file.
+db_file = 'totally_not_my_privateKeys.db'
+
+# Define the host name and server port for the HTTP server.
+hostName = "localhost"
+serverPort = 8080
+
+# Create or open the SQLite database and create the keys table if it doesn't exist.
+db_file = 'totally_not_my_privateKeys.db'
+conn = sqlite3.connect(db_file)
+cursor = conn.cursor()
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS keys (
+        kid INTEGER PRIMARY KEY AUTOINCREMENT,
+        key BLOB NOT NULL,
+        exp INTEGER NOT NULL
     )
+''')
+conn.commit()
+conn.close()
 
-    # Serialize private key to PEM format and encode as Base64
-    private_key_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption()
-    )
-    private_key_base64 = base64.b64encode(private_key_pem)
+# Function to save a private key to the database.
+def save_private_key(key, exp_timestamp):
+    conn = sqlite3.connect(db_file)
+    cursor = conn.cursor()
+    cursor.execute('INSERT INTO keys (key, exp) VALUES (?, ?)', (key, exp_timestamp))
+    conn.commit()
+    conn.close()
 
-    # Get public key in JWK format
-    public_key = private_key.public_key().public_bytes(
-        encoding=serialization.Encoding.DER,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
-    )
+# Function to retrieve a private key from the database.
+def get_private_key(expired=False):
+    conn = sqlite3.connect(db_file)
+    cursor = conn.cursor()
+    if expired:
+        cursor.execute('SELECT key FROM keys WHERE exp < ?', (int(datetime.datetime.utcnow().timestamp()),))
+    else:
+        cursor.execute('SELECT key FROM keys WHERE exp >= ?', (int(datetime.datetime.utcnow().timestamp()),))
+    result = cursor.fetchone()
+    conn.close()
+    if result:
+        return result[0]
+    return None
 
-    expiry_date = datetime.utcnow() + timedelta(hours=expiry_hours)
-    return {
-        'kid': kid,
-        'expiry': expiry_date.timestamp(),
-        'private_key': private_key_base64,
-        'public_key': public_key
-    }
+# Function to convert an integer to a Base64URL-encoded string.
+def int_to_base64(value):
+    """Convert an integer to a Base64URL-encoded string"""
+    value_hex = format(value, 'x')
+    # Ensure even length
+    if len(value_hex) % 2 == 1:
+        value_hex = '0' + value_hex
+    value_bytes = bytes.fromhex(value_hex)
+    encoded = base64.urlsafe_b64encode(value_bytes).rstrip(b'=')
+    return encoded.decode('utf-8')
 
-# Function to generate JWT using the private key
-def generate_jwt(private_key):
-    # Decode Base64-encoded private key
-    private_key_bytes = base64.b64decode(private_key)
-    key = jwt.algorithms.RSAAlgorithm.from_pem(private_key_bytes)
-    jwt_payload = {'sub': 'userABC', 'exp': datetime.utcnow() + timedelta(hours=1)}
-    jwt_token = jwt.encode(jwt_payload, key, algorithm='RS256')
-    return jwt_token
-
-# Web Server Handlers
-class JwksHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.command != 'GET':
-            self.send_error(405, 'Method Not Allowed')
-            return
-
-        keys = [key['public_key'] for key in key_pairs if key['expiry'] > datetime.utcnow().timestamp()]
-        jwks = {'keys': keys}
-        self.send_response(200)
-        self.send_header('Content-type', 'application/json')
+# Create a custom HTTP server by inheriting from BaseHTTPRequestHandler.
+class MyServer(BaseHTTPRequestHandler):
+    # Define unsupported HTTP methods (PUT, PATCH, DELETE, HEAD).
+    def do_PUT(self):
+        self.send_response(405)
         self.end_headers()
-        self.wfile.write(json.dumps(jwks).encode())
+        return
 
-class AuthHandler(http.server.BaseHTTPRequestHandler):
+    def do_PATCH(self):
+        self.send_response(405)
+        self.end_headers()
+        return
+
+    def do_DELETE(self):
+        self.send_response(405)
+        self.end_headers()
+        return
+
+    def do_HEAD(self):
+        self.send_response(405)
+        self.end_headers()
+        return
+
+    # Handle the HTTP POST method.
     def do_POST(self):
-        if self.command != 'POST':
-            self.send_error(405, 'Method Not Allowed')
+        parsed_path = urlparse(self.path)
+        params = parse_qs(parsed_path.query)
+        if parsed_path.path == "/auth":
+            headers = {
+                "kid": "goodKID"
+            }
+            token_payload = {
+                "user": "username",
+                "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+            }
+            if 'expired' in params:
+                headers["kid"] = "expiredKID"
+                private_key = get_private_key(expired=True)  # Retrieve an expired key if the "expired" query parameter is present
+            else:
+                private_key = get_private_key()  # Retrieve an unexpired key
+            if private_key:
+                encoded_jwt = jwt.encode(token_payload, private_key, algorithm="RS256", headers=headers)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(bytes(encoded_jwt, "utf-8"))
+                return
+        # Return a 405 Method Not Allowed for other paths.
+        self.send_response(405)
+        self.end_headers()
+        return
+
+    # Handle the HTTP GET method.
+    def do_GET(self):
+        if self.path == "/.well-known/jwks.json":
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            keys = {
+                "keys": [
+                    {
+                        "alg": "RS256",
+                        "kty": "RSA",
+                        "use": "sig",
+                        "kid": "goodKID",
+                        "n": int_to_base64(numbers.public_numbers.n),
+                        "e": int_to_base64(numbers.public_numbers.e),
+                    }
+                ]
+            }
+            self.wfile.write(bytes(json.dumps(keys), "utf-8"))
             return
 
-        content_length = int(self.headers['Content-Length'])
-        post_data = self.rfile.read(content_length)
-        credentials = json.loads(post_data.decode())
+        # Return a 405 Method Not Allowed for other paths.
+        self.send_response(405)
+        self.end_headers()
+        return
 
-        # Mock authentication (replace with your actual authentication logic)
-        if credentials.get('username') == 'userABC' and credentials.get('password') == 'password123':
-            # Find an unexpired key
-            unexpired_keys = [key for key in key_pairs if key['expiry'] > datetime.utcnow().timestamp()]
-            if unexpired_keys:
-                selected_key = unexpired_keys[0]
-                jwt_token = generate_jwt(selected_key['private_key'])
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({'token': jwt_token}).encode())
-            else:
-                self.send_error(500, 'No unexpired keys available')
-        else:
-            self.send_error(401, 'Unauthorized')
 
-# Generate RSA key pair with a Key ID (kid) and expiry timestamp
-key_pairs = [
-    generate_rsa_key_pair(kid='key1', expiry_hours=1),
-    generate_rsa_key_pair(kid='key2', expiry_hours=1)
-]
+if __name__ == "__main__":
+    # Start the HTTP server and handle requests.
+    webServer = HTTPServer((hostName, serverPort), MyServer)
+    try:
+        webServer.serve_forever()
+    except KeyboardInterrupt:
+        pass
 
-# Set up the servers
-port = 8080
-jwks_handler = socketserver.TCPServer(("", port), JwksHandler)
-auth_handler = socketserver.TCPServer(("", port + 1), AuthHandler)
-
-# Run the servers
-print(f"Starting JWKS server on port {port}")
-jwks_handler.serve_forever()
-
-print(f"Starting Auth server on port {port + 1}")
-auth_handler.serve_forever()
+    # Close the server if interrupted.
+    webServer.server_close()
